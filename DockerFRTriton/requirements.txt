@@ -1,0 +1,11 @@
+torch>=2.0
+onnx>=1.14
+tritonclient[http]>=2.41.0
+numpy>=1.24
+Pillow>=10.0
+fastapi>=0.110
+uvicorn[standard]>=0.23
+python-multipart>=0.0.6
+opencv-python-headless
+onnxscript
+torchvision
