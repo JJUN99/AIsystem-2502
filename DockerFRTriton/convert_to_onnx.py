@@ -5,114 +5,415 @@ import onnx
 import torch
 from torch import nn
 
+import os
+import requests
+from requests.adapters import HTTPAdapter
 
-from torch.nn import Linear, Conv2d, BatchNorm1d, BatchNorm2d, PReLU, ReLU, Sigmoid, Dropout2d, Dropout, AvgPool2d, MaxPool2d, AdaptiveAvgPool2d, Sequential, Module, Parameter
-import torch.nn.functional as F
+import torch
+from torch import nn
+from torch.nn import functional as F
 
-class Flatten(Module):
-    def forward(self, input):
-        return input.view(input.size(0), -1)
+import hashlib
+import os
+import shutil
+import sys
+import tempfile
 
-def l2_norm(input,axis=1):
-    norm = torch.norm(input,2,axis,True)
-    output = torch.div(input, norm)
-    return output
+from urllib.request import urlopen, Request
 
-class Conv_block(Module):
-    def __init__(self, in_c, out_c, kernel=(1, 1), stride=(1, 1), padding=(0, 0), groups=1):
-        super(Conv_block, self).__init__()
-        self.conv = Conv2d(in_c, out_channels=out_c, kernel_size=kernel, groups=groups, stride=stride, padding=padding, bias=False)
-        self.bn = BatchNorm2d(out_c)
-        self.prelu = PReLU(out_c)
+try:
+    from tqdm.auto import tqdm  # automatically select proper tqdm submodule if available
+except ImportError:
+    from tqdm import tqdm
+
+
+def download_url_to_file(url, dst, hash_prefix=None, progress=True):
+    r"""Download object at the given URL to a local path.
+    Args:
+        url (string): URL of the object to download
+        dst (string): Full path where object will be saved, e.g. `/tmp/temporary_file`
+        hash_prefix (string, optional): If not None, the SHA256 downloaded file should start with `hash_prefix`.
+            Default: None
+        progress (bool, optional): whether or not to display a progress bar to stderr
+            Default: True
+    Example:
+        >>> torch.hub.download_url_to_file('https://s3.amazonaws.com/pytorch/models/resnet18-5c106cde.pth', '/tmp/temporary_file')
+    """
+    file_size = None
+    # We use a different API for python2 since urllib(2) doesn't recognize the CA
+    # certificates in older Python
+    req = Request(url, headers={"User-Agent": "torch.hub"})
+    u = urlopen(req)
+    meta = u.info()
+    if hasattr(meta, 'getheaders'):
+        content_length = meta.getheaders("Content-Length")
+    else:
+        content_length = meta.get_all("Content-Length")
+    if content_length is not None and len(content_length) > 0:
+        file_size = int(content_length[0])
+
+    # We deliberately save it in a temp file and move it after
+    # download is complete. This prevents a local working checkpoint
+    # being overridden by a broken download.
+    dst = os.path.expanduser(dst)
+    dst_dir = os.path.dirname(dst)
+    f = tempfile.NamedTemporaryFile(delete=False, dir=dst_dir)
+
+    try:
+        if hash_prefix is not None:
+            sha256 = hashlib.sha256()
+        with tqdm(total=file_size, disable=not progress,
+                  unit='B', unit_scale=True, unit_divisor=1024) as pbar:
+            while True:
+                buffer = u.read(8192)
+                if len(buffer) == 0:
+                    break
+                f.write(buffer)
+                if hash_prefix is not None:
+                    sha256.update(buffer)
+                pbar.update(len(buffer))
+
+        f.close()
+        if hash_prefix is not None:
+            digest = sha256.hexdigest()
+            if digest[:len(hash_prefix)] != hash_prefix:
+                raise RuntimeError('invalid hash value (expected "{}", got "{}")'
+                                   .format(hash_prefix, digest))
+        shutil.move(f.name, dst)
+    finally:
+        f.close()
+        if os.path.exists(f.name):
+            os.remove(f.name)
+
+class BasicConv2d(nn.Module):
+
+    def __init__(self, in_planes, out_planes, kernel_size, stride, padding=0):
+        super().__init__()
+        self.conv = nn.Conv2d(
+            in_planes, out_planes,
+            kernel_size=kernel_size, stride=stride,
+            padding=padding, bias=False
+        ) # verify bias false
+        self.bn = nn.BatchNorm2d(
+            out_planes,
+            eps=0.001, # value found in tensorflow
+            momentum=0.1, # default pytorch value
+            affine=True
+        )
+        self.relu = nn.ReLU(inplace=False)
+
     def forward(self, x):
         x = self.conv(x)
         x = self.bn(x)
-        x = self.prelu(x)
+        x = self.relu(x)
         return x
 
-class Linear_block(Module):
-    def __init__(self, in_c, out_c, kernel=(1, 1), stride=(1, 1), padding=(0, 0), groups=1):
-        super(Linear_block, self).__init__()
-        self.conv = Conv2d(in_c, out_channels=out_c, kernel_size=kernel, groups=groups, stride=stride, padding=padding, bias=False)
-        self.bn = BatchNorm2d(out_c)
+
+class Block35(nn.Module):
+
+    def __init__(self, scale=1.0):
+        super().__init__()
+
+        self.scale = scale
+
+        self.branch0 = BasicConv2d(256, 32, kernel_size=1, stride=1)
+
+        self.branch1 = nn.Sequential(
+            BasicConv2d(256, 32, kernel_size=1, stride=1),
+            BasicConv2d(32, 32, kernel_size=3, stride=1, padding=1)
+        )
+
+        self.branch2 = nn.Sequential(
+            BasicConv2d(256, 32, kernel_size=1, stride=1),
+            BasicConv2d(32, 32, kernel_size=3, stride=1, padding=1),
+            BasicConv2d(32, 32, kernel_size=3, stride=1, padding=1)
+        )
+
+        self.conv2d = nn.Conv2d(96, 256, kernel_size=1, stride=1)
+        self.relu = nn.ReLU(inplace=False)
+
     def forward(self, x):
-        x = self.conv(x)
-        x = self.bn(x)
-        return x
+        x0 = self.branch0(x)
+        x1 = self.branch1(x)
+        x2 = self.branch2(x)
+        out = torch.cat((x0, x1, x2), 1)
+        out = self.conv2d(out)
+        out = out * self.scale + x
+        out = self.relu(out)
+        return out
 
-class Depth_Wise(Module):
-     def __init__(self, in_c, out_c, residual = False, kernel=(3, 3), stride=(2, 2), padding=(1, 1), groups=1):
-        super(Depth_Wise, self).__init__()
-        self.conv = Conv_block(in_c, out_c=groups, kernel=(1, 1), padding=(0, 0), stride=(1, 1))
-        self.conv_dw = Conv_block(groups, groups, groups=groups, kernel=kernel, padding=padding, stride=stride)
-        self.project = Linear_block(groups, out_c, kernel=(1, 1), padding=(0, 0), stride=(1, 1))
-        self.residual = residual
-     def forward(self, x):
-        if self.residual:
-            short_cut = x
-        x = self.conv(x)
-        x = self.conv_dw(x)
-        x = self.project(x)
-        if self.residual:
-            output = short_cut + x
+
+class Block17(nn.Module):
+
+    def __init__(self, scale=1.0):
+        super().__init__()
+
+        self.scale = scale
+
+        self.branch0 = BasicConv2d(896, 128, kernel_size=1, stride=1)
+
+        self.branch1 = nn.Sequential(
+            BasicConv2d(896, 128, kernel_size=1, stride=1),
+            BasicConv2d(128, 128, kernel_size=(1,7), stride=1, padding=(0,3)),
+            BasicConv2d(128, 128, kernel_size=(7,1), stride=1, padding=(3,0))
+        )
+
+        self.conv2d = nn.Conv2d(256, 896, kernel_size=1, stride=1)
+        self.relu = nn.ReLU(inplace=False)
+
+    def forward(self, x):
+        x0 = self.branch0(x)
+        x1 = self.branch1(x)
+        out = torch.cat((x0, x1), 1)
+        out = self.conv2d(out)
+        out = out * self.scale + x
+        out = self.relu(out)
+        return out
+
+
+class Block8(nn.Module):
+
+    def __init__(self, scale=1.0, noReLU=False):
+        super().__init__()
+
+        self.scale = scale
+        self.noReLU = noReLU
+
+        self.branch0 = BasicConv2d(1792, 192, kernel_size=1, stride=1)
+
+        self.branch1 = nn.Sequential(
+            BasicConv2d(1792, 192, kernel_size=1, stride=1),
+            BasicConv2d(192, 192, kernel_size=(1,3), stride=1, padding=(0,1)),
+            BasicConv2d(192, 192, kernel_size=(3,1), stride=1, padding=(1,0))
+        )
+
+        self.conv2d = nn.Conv2d(384, 1792, kernel_size=1, stride=1)
+        if not self.noReLU:
+            self.relu = nn.ReLU(inplace=False)
+
+    def forward(self, x):
+        x0 = self.branch0(x)
+        x1 = self.branch1(x)
+        out = torch.cat((x0, x1), 1)
+        out = self.conv2d(out)
+        out = out * self.scale + x
+        if not self.noReLU:
+            out = self.relu(out)
+        return out
+
+
+class Mixed_6a(nn.Module):
+
+    def __init__(self):
+        super().__init__()
+
+        self.branch0 = BasicConv2d(256, 384, kernel_size=3, stride=2)
+
+        self.branch1 = nn.Sequential(
+            BasicConv2d(256, 192, kernel_size=1, stride=1),
+            BasicConv2d(192, 192, kernel_size=3, stride=1, padding=1),
+            BasicConv2d(192, 256, kernel_size=3, stride=2)
+        )
+
+        self.branch2 = nn.MaxPool2d(3, stride=2)
+
+    def forward(self, x):
+        x0 = self.branch0(x)
+        x1 = self.branch1(x)
+        x2 = self.branch2(x)
+        out = torch.cat((x0, x1, x2), 1)
+        return out
+
+
+class Mixed_7a(nn.Module):
+
+    def __init__(self):
+        super().__init__()
+
+        self.branch0 = nn.Sequential(
+            BasicConv2d(896, 256, kernel_size=1, stride=1),
+            BasicConv2d(256, 384, kernel_size=3, stride=2)
+        )
+
+        self.branch1 = nn.Sequential(
+            BasicConv2d(896, 256, kernel_size=1, stride=1),
+            BasicConv2d(256, 256, kernel_size=3, stride=2)
+        )
+
+        self.branch2 = nn.Sequential(
+            BasicConv2d(896, 256, kernel_size=1, stride=1),
+            BasicConv2d(256, 256, kernel_size=3, stride=1, padding=1),
+            BasicConv2d(256, 256, kernel_size=3, stride=2)
+        )
+
+        self.branch3 = nn.MaxPool2d(3, stride=2)
+
+    def forward(self, x):
+        x0 = self.branch0(x)
+        x1 = self.branch1(x)
+        x2 = self.branch2(x)
+        x3 = self.branch3(x)
+        out = torch.cat((x0, x1, x2, x3), 1)
+        return out
+
+
+class InceptionResnetV1(nn.Module):
+    """Inception Resnet V1 model with optional loading of pretrained weights.
+
+    Model parameters can be loaded based on pretraining on the VGGFace2 or CASIA-Webface
+    datasets. Pretrained state_dicts are automatically downloaded on model instantiation if
+    requested and cached in the torch cache. Subsequent instantiations use the cache rather than
+    redownloading.
+
+    Keyword Arguments:
+        pretrained {str} -- Optional pretraining dataset. Either 'vggface2' or 'casia-webface'.
+            (default: {None})
+        classify {bool} -- Whether the model should output classification probabilities or feature
+            embeddings. (default: {False})
+        num_classes {int} -- Number of output classes. If 'pretrained' is set and num_classes not
+            equal to that used for the pretrained model, the final linear layer will be randomly
+            initialized. (default: {None})
+        dropout_prob {float} -- Dropout probability. (default: {0.6})
+    """
+    def __init__(self, pretrained=None, classify=False, num_classes=None, dropout_prob=0.6, device=None):
+        super().__init__()
+
+        # Set simple attributes
+        self.pretrained = pretrained
+        self.classify = classify
+        self.num_classes = num_classes
+
+        if pretrained == 'vggface2':
+            tmp_classes = 8631
+        elif pretrained == 'casia-webface':
+            tmp_classes = 10575
+        elif pretrained is None and self.classify and self.num_classes is None:
+            raise Exception('If "pretrained" is not specified and "classify" is True, "num_classes" must be specified')
+
+
+        # Define layers
+        self.conv2d_1a = BasicConv2d(3, 32, kernel_size=3, stride=2)
+        self.conv2d_2a = BasicConv2d(32, 32, kernel_size=3, stride=1)
+        self.conv2d_2b = BasicConv2d(32, 64, kernel_size=3, stride=1, padding=1)
+        self.maxpool_3a = nn.MaxPool2d(3, stride=2)
+        self.conv2d_3b = BasicConv2d(64, 80, kernel_size=1, stride=1)
+        self.conv2d_4a = BasicConv2d(80, 192, kernel_size=3, stride=1)
+        self.conv2d_4b = BasicConv2d(192, 256, kernel_size=3, stride=2)
+        self.repeat_1 = nn.Sequential(
+            Block35(scale=0.17),
+            Block35(scale=0.17),
+            Block35(scale=0.17),
+            Block35(scale=0.17),
+            Block35(scale=0.17),
+        )
+        self.mixed_6a = Mixed_6a()
+        self.repeat_2 = nn.Sequential(
+            Block17(scale=0.10),
+            Block17(scale=0.10),
+            Block17(scale=0.10),
+            Block17(scale=0.10),
+            Block17(scale=0.10),
+            Block17(scale=0.10),
+            Block17(scale=0.10),
+            Block17(scale=0.10),
+            Block17(scale=0.10),
+            Block17(scale=0.10),
+        )
+        self.mixed_7a = Mixed_7a()
+        self.repeat_3 = nn.Sequential(
+            Block8(scale=0.20),
+            Block8(scale=0.20),
+            Block8(scale=0.20),
+            Block8(scale=0.20),
+            Block8(scale=0.20),
+        )
+        self.block8 = Block8(noReLU=True)
+        self.avgpool_1a = nn.AdaptiveAvgPool2d(1)
+        self.dropout = nn.Dropout(dropout_prob)
+        self.last_linear = nn.Linear(1792, 512, bias=False)
+        self.last_bn = nn.BatchNorm1d(512, eps=0.001, momentum=0.1, affine=True)
+
+        if pretrained is not None:
+            self.logits = nn.Linear(512, tmp_classes)
+            load_weights(self, pretrained)
+
+        if self.classify and self.num_classes is not None:
+            self.logits = nn.Linear(512, self.num_classes)
+
+        self.device = torch.device('cpu')
+        if device is not None:
+            self.device = device
+            self.to(device)
+
+    def forward(self, x):
+        """Calculate embeddings or logits given a batch of input image tensors.
+
+        Arguments:
+            x {torch.tensor} -- Batch of image tensors representing faces.
+
+        Returns:
+            torch.tensor -- Batch of embedding vectors or multinomial logits.
+        """
+        x = self.conv2d_1a(x)
+        x = self.conv2d_2a(x)
+        x = self.conv2d_2b(x)
+        x = self.maxpool_3a(x)
+        x = self.conv2d_3b(x)
+        x = self.conv2d_4a(x)
+        x = self.conv2d_4b(x)
+        x = self.repeat_1(x)
+        x = self.mixed_6a(x)
+        x = self.repeat_2(x)
+        x = self.mixed_7a(x)
+        x = self.repeat_3(x)
+        x = self.block8(x)
+        x = self.avgpool_1a(x)
+        x = self.dropout(x)
+        x = self.last_linear(x.view(x.shape[0], -1))
+        x = self.last_bn(x)
+        if self.classify:
+            x = self.logits(x)
         else:
-            output = x
-        return output
+            x = F.normalize(x, p=2, dim=1)
+        return x
 
-class Residual(Module):
-    def __init__(self, c, num_block, groups, kernel=(3, 3), stride=(1, 1), padding=(1, 1)):
-        super(Residual, self).__init__()
-        modules = []
-        for _ in range(num_block):
-            modules.append(Depth_Wise(c, c, residual=True, kernel=kernel, padding=padding, stride=stride, groups=groups))
-        self.model = Sequential(*modules)
-    def forward(self, x):
-        return self.model(x)
 
-class MobileFaceNet(Module):
-    def __init__(self, embedding_size):
-        super(MobileFaceNet, self).__init__()
-        self.conv1 = Conv_block(3, 64, kernel=(3, 3), stride=(2, 2), padding=(1, 1))
-        self.conv2_dw = Conv_block(64, 64, kernel=(3, 3), stride=(1, 1), padding=(1, 1), groups=64)
-        self.conv_23 = Depth_Wise(64, 64, kernel=(3, 3), stride=(2, 2), padding=(1, 1), groups=128)
-        self.conv_3 = Residual(64, num_block=4, groups=128, kernel=(3, 3), stride=(1, 1), padding=(1, 1))
-        self.conv_34 = Depth_Wise(64, 128, kernel=(3, 3), stride=(2, 2), padding=(1, 1), groups=256)
-        self.conv_4 = Residual(128, num_block=6, groups=256, kernel=(3, 3), stride=(1, 1), padding=(1, 1))
-        self.conv_45 = Depth_Wise(128, 128, kernel=(3, 3), stride=(2, 2), padding=(1, 1), groups=512)
-        self.conv_5 = Residual(128, num_block=2, groups=256, kernel=(3, 3), stride=(1, 1), padding=(1, 1))
-        self.conv_6_sep = Conv_block(128, 512, kernel=(1, 1), stride=(1, 1), padding=(0, 0))
-        self.conv_6_dw = Linear_block(512, 512, groups=512, kernel=(7,7), stride=(1, 1), padding=(0, 0))
-        self.conv_6_flatten = Flatten()
-        self.linear = Linear(512, embedding_size, bias=False)
-        self.bn = BatchNorm1d(embedding_size)
-    
-    def forward(self, x):
-        out = self.conv1(x)
+def load_weights(mdl, name):
+    """Download pretrained state_dict and load into model.
 
-        out = self.conv2_dw(out)
+    Arguments:
+        mdl {torch.nn.Module} -- Pytorch model.
+        name {str} -- Name of dataset that was used to generate pretrained state_dict.
 
-        out = self.conv_23(out)
+    Raises:
+        ValueError: If 'pretrained' not equal to 'vggface2' or 'casia-webface'.
+    """
+    if name == 'vggface2':
+        path = 'https://github.com/timesler/facenet-pytorch/releases/download/v2.2.9/20180402-114759-vggface2.pt'
+    elif name == 'casia-webface':
+        path = 'https://github.com/timesler/facenet-pytorch/releases/download/v2.2.9/20180408-102900-casia-webface.pt'
+    else:
+        raise ValueError('Pretrained models only exist for "vggface2" and "casia-webface"')
 
-        out = self.conv_3(out)
-        
-        out = self.conv_34(out)
+    model_dir = os.path.join(get_torch_home(), 'checkpoints')
+    os.makedirs(model_dir, exist_ok=True)
 
-        out = self.conv_4(out)
+    cached_file = os.path.join(model_dir, os.path.basename(path))
+    if not os.path.exists(cached_file):
+        download_url_to_file(path, cached_file)
 
-        out = self.conv_45(out)
+    state_dict = torch.load(cached_file)
+    mdl.load_state_dict(state_dict)
 
-        out = self.conv_5(out)
 
-        out = self.conv_6_sep(out)
-
-        out = self.conv_6_dw(out)
-
-        out = self.conv_6_flatten(out)
-
-        out = self.linear(out)
-
-        out = self.bn(out)
-        return l2_norm(out)
+def get_torch_home():
+    torch_home = os.path.expanduser(
+        os.getenv(
+            'TORCH_HOME',
+            os.path.join(os.getenv('XDG_CACHE_HOME', '~/.cache'), 'torch')
+        )
+    )
+    return torch_home
 
 
 def _load_state_if_available(model: nn.Module, weights_path: Path) -> None:
@@ -125,7 +426,7 @@ def _load_state_if_available(model: nn.Module, weights_path: Path) -> None:
         state = state["state_dict"]
     if isinstance(state, dict):
         state = {k.replace("module.", "", 1) if k.startswith("module.") else k: v for k, v in state.items()}
-        missing_unexpected = model.load_state_dict(state, strict=False)
+        missing_unexpected = model.load_state_dict(state, strict=True)
         if missing_unexpected.missing_keys:
             print(f"[convert] Missing keys: {missing_unexpected.missing_keys}")
         if missing_unexpected.unexpected_keys:
@@ -142,12 +443,11 @@ def convert_model_to_onnx(weights_path: Path, onnx_path: Path, opset: int) -> No
     Swap out `ToyFRModel` with your actual FR backbone once ready; the rest of
     the export pipeline stays the same.
     """
-    model = MobileFaceNet(512)
-    _load_state_if_available(model, weights_path)
+    model = InceptionResnetV1(pretrained = 'vggface2')
     model.eval()
 
     onnx_path.parent.mkdir(parents=True, exist_ok=True)
-    dummy_input = torch.randn(1, 3, 112, 112)
+    dummy_input = torch.randn(1, 3, 160, 160)
     dynamic_axes = {"input": {0: "batch_size"}, "embedding": {0: "batch_size"}}
 
     torch.onnx.export(
@@ -156,7 +456,7 @@ def convert_model_to_onnx(weights_path: Path, onnx_path: Path, opset: int) -> No
         onnx_path,
         input_names=["input"],
         output_names=["embedding"],
-        # dynamic_axes=dynamic_axes,
+        dynamic_axes=dynamic_axes,
         opset_version=opset,
         do_constant_folding=True,
     )
@@ -166,7 +466,7 @@ def convert_model_to_onnx(weights_path: Path, onnx_path: Path, opset: int) -> No
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Convert FR model to ONNX for Triton.")
-    parser.add_argument("--weights-path", type=Path, default='./model_mobilefacenet.pth', help="Path to FR model weights (.pth).")
+    parser.add_argument("--weights-path", type=Path, default='', help="Path to FR model weights (.pth).")
     parser.add_argument(
         "--onnx-path",
         type=Path,

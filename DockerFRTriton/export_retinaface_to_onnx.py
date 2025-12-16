@@ -4,25 +4,26 @@ from pathlib import Path
 import onnx
 import torch
 
+
 # from nms import nms  # noqa: F401  # placeholder; intentionally left empty
 from retinaface_model import RetinaFace
 
-
-WEIGHT_URL = "https://github.com/biubug6/Pytorch_Retinaface/releases/download/0.0.1/mobilenet0.25_Final.pth"
-
-
-def download_weights(dest: Path) -> Path:
-    """Download the pretrained MobileNet0.25 RetinaFace weights if missing."""
-    if dest.exists():
-        print(f"Using existing weights: {dest}")
-        return dest
-
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    print(f"Downloading RetinaFace MobileNet0.25 weights to {dest} ...")
-    torch.hub.download_url_to_file(WEIGHT_URL, dest)
-    print("Download complete.")
-    return dest
-
+cfg_mnet_025 = {
+    'name': 'mobilenet0.25',
+    'min_sizes': [[16, 32], [64, 128], [256, 512]],
+    'steps': [8, 16, 32],
+    'variance': [0.1, 0.2],
+    'clip': False,
+    'loc_weight': 2.0,
+    'batch_size': 32,
+    'epochs': 250,
+    'milestones': [190, 220],
+    'image_size': 640,
+    'pretrain': False,
+    'return_layers': {'stage1': 1, 'stage2': 2, 'stage3': 3},
+    'in_channel': 32,
+    'out_channel': 64
+}
 
 def load_weights(model: torch.nn.Module, weights_path: Path) -> None:
     state = torch.load(weights_path, map_location="cpu")
@@ -42,12 +43,20 @@ def load_weights(model: torch.nn.Module, weights_path: Path) -> None:
 def export_to_onnx(model: torch.nn.Module, onnx_path: Path, image_size: int, opset: int) -> None:
     onnx_path.parent.mkdir(parents=True, exist_ok=True)
     dummy_input = torch.randn(1, 3, image_size, image_size)
-    dynamic_axes = {
-        "input": {0: "batch"},
-        "loc": {0: "batch"},
-        "conf": {0: "batch"},
-        "landms": {0: "batch"},
-    }
+    dynamic_axes={
+            'input': {
+                0: 'batch_size', 
+            },
+            'loc': {
+                0: 'batch_size',
+            },
+            'conf': {
+                0: 'batch_size',
+            },
+            'landms': {
+                0: 'batch_size',
+            }
+        }
 
     torch.onnx.export(
         model,
@@ -55,9 +64,10 @@ def export_to_onnx(model: torch.nn.Module, onnx_path: Path, image_size: int, ops
         onnx_path,
         input_names=["input"],
         output_names=["loc", "conf", "landms"],
-        # dynamic_axes=dynamic_axes,
+        dynamic_axes=dynamic_axes,
         opset_version=opset,
         do_constant_folding=True,
+        # dynamo=True
     )
     onnx.checker.check_model(onnx.load(str(onnx_path)))
     print(f"ONNX export completed: {onnx_path}")
@@ -95,9 +105,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    # weights_path = download_weights(args.weights_path)
-
-    model = RetinaFace(phase="test", width_mult=0.25)
+    model = RetinaFace(cfg=cfg_mnet_025)
     load_weights(model, args.weights_path)
     model.eval()
 

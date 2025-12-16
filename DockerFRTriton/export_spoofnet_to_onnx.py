@@ -36,7 +36,7 @@ def export_to_onnx(model: torch.nn.Module, onnx_path: Path, image_size: int, ops
         onnx_path,
         input_names=["input"],
         output_names=["x"],
-        # dynamic_axes=dynamic_axes,
+        dynamic_axes=dynamic_axes,
         opset_version=opset,
         do_constant_folding=True,
     )

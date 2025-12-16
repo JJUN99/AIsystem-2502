@@ -1,209 +1,218 @@
+from collections import OrderedDict
+from typing import Any, Callable, List, Optional, Tuple
+
 import torch
-import torch.nn as nn
+from torch import nn, Tensor
 import torch.nn.functional as F
+import torchvision.models._utils as _utils
 
+from mobilenetv1 import mobilenet_v1_025
+from torchvision import models
+from common import SSH, FPN, IntermediateLayerGetterByIndex
 
-def conv_bn(inp: int, oup: int, stride: int = 1, relu: bool = True) -> nn.Sequential:
-    layers = [
-        nn.Conv2d(inp, oup, kernel_size=3, stride=stride, padding=1, bias=False),
-        nn.BatchNorm2d(oup),
-    ]
-    if relu:
-        layers.append(nn.ReLU(inplace=True))
-    return nn.Sequential(*layers)
+class Conv2dNormActivation(nn.Sequential):
+    """Convolutional block, consists of nn.Conv2d, nn.BatchNorm2d, nn.ReLU"""
 
+    def __init__(
+            self,
+            in_channels: int,
+            out_channels: int,
+            kernel_size: int = 3,
+            stride: int = 1,
+            padding: Optional = None,
+            groups: int = 1,
+            norm_layer: Optional[Callable[..., torch.nn.Module]] = torch.nn.BatchNorm2d,
+            activation_layer: Optional[Callable[..., torch.nn.Module]] = torch.nn.LeakyReLU,
+            dilation: int = 1,
+            inplace: Optional[bool] = True,
+            negative_slope: Optional[float] = None,
+            bias: bool = False,
+    ) -> None:
 
-def conv_bn_no_relu(inp: int, oup: int, stride: int = 1) -> nn.Sequential:
-    return conv_bn(inp, oup, stride=stride, relu=False)
+        if padding is None:
+            padding = (kernel_size - 1) // 2 * dilation
 
-
-class DepthWise(nn.Module):
-    def __init__(self, inp: int, oup: int, stride: int):
-        super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(inp, inp, kernel_size=3, stride=stride, padding=1, groups=inp, bias=False),
-            nn.BatchNorm2d(inp),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(inp, oup, kernel_size=1, stride=1, padding=0, bias=False),
-            nn.BatchNorm2d(oup),
-            nn.ReLU(inplace=True),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.conv(x)
-
-
-class MobileNetV1(nn.Module):
-    """MobileNetV1 backbone with width multiplier for the 0.25x RetinaFace variant."""
-
-    def __init__(self, width_mult: float = 0.25):
-        super().__init__()
-        self.width_mult = width_mult
-        scale = lambda c: max(1, int(c * width_mult))
-
-        self.conv1 = conv_bn(3, scale(32), stride=2)
-
-        cfg = [
-            (64, 1),
-            (128, 2),
-            (128, 1),
-            (256, 2),
-            (256, 1),
-            (256, 1),  # P3 (stride 8) after this layer
-            (512, 2),
-            (512, 1),
-            (512, 1),
-            (512, 1),
-            (512, 1),
-            (512, 1),  # P4 (stride 16) after this layer
-            (1024, 2),
-            (1024, 1),  # P5 (stride 32) after this layer
+        layers: List[nn.Module] = [
+            nn.Conv2d(
+                in_channels=in_channels,
+                out_channels=out_channels,
+                kernel_size=kernel_size,
+                stride=stride,
+                padding=padding,
+                dilation=dilation,
+                groups=groups,
+                bias=bias,
+            )
         ]
+        if norm_layer is not None:
+            layers.append(norm_layer(out_channels))
 
-        layers = []
-        in_channels = scale(32)
-        for out_channels, stride in cfg:
-            oc = scale(out_channels)
-            layers.append(DepthWise(in_channels, oc, stride))
-            in_channels = oc
-        self.stages = nn.ModuleList(layers)
-        # Indices in cfg that correspond to stride 8, 16, and 32 respectively.
-        self.output_layers = {5, 11, 13}
-
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        x = self.conv1(x)
-        outputs = []
-        for idx, layer in enumerate(self.stages):
-            x = layer(x)
-            if idx in self.output_layers:
-                outputs.append(x)
-        if len(outputs) != 3:
-            raise RuntimeError(f"Expected 3 feature maps, got {len(outputs)}")
-        return outputs[0], outputs[1], outputs[2]
+        if activation_layer is not None:
+            params = {} if inplace is None else {"inplace": inplace}
+            if negative_slope is not None:
+                params["negative_slope"] = negative_slope
+            layers.append(activation_layer(**params))
+        super().__init__(*layers)
 
 
-class FPN(nn.Module):
-    def __init__(self, in_channels: list[int], out_channels: int):
-        super().__init__()
-        self.output1 = nn.Conv2d(in_channels[0], out_channels, kernel_size=1, stride=1, padding=0)
-        self.output2 = nn.Conv2d(in_channels[1], out_channels, kernel_size=1, stride=1, padding=0)
-        self.output3 = nn.Conv2d(in_channels[2], out_channels, kernel_size=1, stride=1, padding=0)
+def get_layer_extractor(cfg, backbone):
+    """
+    Selects the appropriate layers from the backbone based on the configuration.
 
-        self.merge1 = conv_bn(out_channels, out_channels, stride=1)
-        self.merge2 = conv_bn(out_channels, out_channels, stride=1)
+    Args:
+        cfg (dict): Configuration dictionary containing the model name and return layers.
+        backbone (nn.Module): The backbone network from which to extract layers.
 
-    def forward(self, inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        c3, c4, c5 = inputs
-
-        p5 = self.output3(c5)
-        p4 = self.output2(c4)
-        p3 = self.output1(c3)
-
-        p4 = p4 + F.interpolate(p5, size=p4.shape[2:], mode="nearest")
-        p3 = p3 + F.interpolate(p4, size=p3.shape[2:], mode="nearest")
-
-        p4 = self.merge2(p4)
-        p3 = self.merge1(p3)
-
-        return p3, p4, p5
+    Returns:
+        IntermediateLayerGetter or IntermediateLayerGetterByIndex: The appropriate layer getter.
+    """
+    if cfg['name'] == "mobilenet_v2":
+        return IntermediateLayerGetterByIndex(backbone, [6, 13, 18])
+    else:
+        return _utils.IntermediateLayerGetter(backbone, cfg['return_layers'])
 
 
-class SSH(nn.Module):
-    def __init__(self, in_channel: int, out_channel: int):
-        super().__init__()
-        assert out_channel % 4 == 0, "SSH out_channel should be divisible by 4"
-        self.conv3x3 = conv_bn_no_relu(in_channel, out_channel // 2, stride=1)
+def build_backbone(name, pretrained=False):
+    """
+    Builds the backbone of the RetinaFace model based on configuration.
 
-        self.conv5x5_1 = conv_bn(in_channel, out_channel // 4, stride=1)
-        self.conv5x5_2 = conv_bn_no_relu(out_channel // 4, out_channel // 4, stride=1)
+    Args:
+        name (str): Backbone name (e.g., 'mobilenet0.25', 'Resnet50').
+        pretrained (bool): If True, load pretrained weights.
 
-        self.conv7x7_2 = conv_bn_no_relu(out_channel // 4, out_channel // 4, stride=1)
+    Returns:
+        nn.Module: The chosen backbone network.
+    """
+    backbone_map = {
+        'mobilenet0.25': lambda: mobilenet_v1_025(pretrained=pretrained),
+    }
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        conv3x3 = self.conv3x3(x)
+    if name not in backbone_map:
+        raise ValueError(f"Unsupported backbone name: {name}")
 
-        conv5x5_1 = self.conv5x5_1(x)
-        conv5x5 = self.conv5x5_2(conv5x5_1)
-
-        conv7x7 = self.conv7x7_2(conv5x5)
-
-        out = torch.cat([conv3x3, conv5x5, conv7x7], dim=1)
-        out = F.relu(out)
-        return out
+    return backbone_map[name]()
 
 
 class ClassHead(nn.Module):
-    def __init__(self, in_channel: int, num_anchor: int = 2):
+    def __init__(self, in_channels: int = 512, num_anchors: int = 2, fpn_num: int = 3) -> None:
         super().__init__()
-        self.conv1x1 = nn.Conv2d(in_channel, num_anchor * 2, kernel_size=1, stride=1, padding=0)
+        self.class_head = nn.ModuleList([
+            nn.Conv2d(
+                in_channels=in_channels,
+                out_channels=num_anchors * 2,
+                kernel_size=(1, 1),
+                stride=1,
+                padding=0
+            )
+            for _ in range(fpn_num)
+        ])
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = self.conv1x1(x)
-        out = out.permute(0, 2, 3, 1).contiguous()
-        # 🚨 수정: out.shape[0] 대신 -1 사용.
-        # 가운데 차원: Height * Width * Num_Anchors
-        # Num_Anchors = out.shape[3] // 2
-        return out.view(-1, out.shape[1] * out.shape[2] * (out.shape[3] // 2), 2)
+    def forward(self, x: List[Tensor]) -> Tensor:
+        outputs = []
+        for feature, layer in zip(x, self.class_head):
+            outputs.append(layer(feature).permute(0, 2, 3, 1).contiguous())
+
+        outputs = torch.cat([out.view(out.shape[0], -1, 2) for out in outputs], dim=1)
+        return outputs
 
 
 class BboxHead(nn.Module):
-    def __init__(self, in_channel: int, num_anchor: int = 2):
+    def __init__(self, in_channels: int = 512, num_anchors: int = 2, fpn_num: int = 3) -> None:
         super().__init__()
-        self.conv1x1 = nn.Conv2d(in_channel, num_anchor * 4, kernel_size=1, stride=1, padding=0)
+        self.bbox_head = nn.ModuleList([
+            nn.Conv2d(
+                in_channels=in_channels,
+                out_channels=num_anchors * 4,
+                kernel_size=(1, 1),
+                stride=1,
+                padding=0
+            )
+            for _ in range(fpn_num)
+        ])
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = self.conv1x1(x)
-        out = out.permute(0, 2, 3, 1).contiguous()
-        # 🚨 수정: out.shape[0] 대신 -1 사용
-        return out.view(-1, out.shape[1] * out.shape[2] * (out.shape[3] // 4), 4)
+    def forward(self, x: List[Tensor]) -> Tensor:
+        outputs = []
+        for feature, layer in zip(x, self.bbox_head):
+            outputs.append(layer(feature).permute(0, 2, 3, 1).contiguous())
+
+        outputs = torch.cat([out.view(out.shape[0], -1, 4) for out in outputs], dim=1)
+        return outputs
 
 
 class LandmarkHead(nn.Module):
-    def __init__(self, in_channel: int, num_anchor: int = 2):
+    def __init__(self, in_channels: int = 512, num_anchors: int = 2, fpn_num: int = 3) -> None:
         super().__init__()
-        self.conv1x1 = nn.Conv2d(in_channel, num_anchor * 10, kernel_size=1, stride=1, padding=0)
+        self.landmark_head = nn.ModuleList([
+            nn.Conv2d(
+                in_channels,
+                num_anchors * 10,
+                kernel_size=(1, 1),
+                stride=1,
+                padding=0
+            )
+            for _ in range(fpn_num)
+        ])
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = self.conv1x1(x)
-        out = out.permute(0, 2, 3, 1).contiguous()
-        # 🚨 수정: out.shape[0] 대신 -1 사용
-        return out.view(-1, out.shape[1] * out.shape[2] * (out.shape[3] // 10), 10)
+    def forward(self, x: List[Tensor]) -> Tensor:
+        outputs = []
+        for feature, layer in zip(x, self.landmark_head):
+            outputs.append(layer(feature).permute(0, 2, 3, 1).contiguous())
+
+        outputs = torch.cat([out.view(out.shape[0], -1, 10) for out in outputs], dim=1)
+        return outputs
 
 
 class RetinaFace(nn.Module):
-    def __init__(self, phase: str = "test", width_mult: float = 0.25):
+    def __init__(self, cfg: dict = None) -> None:
+        """
+        RetinaFace model constructor.
+
+        Args:
+            cfg (dict): A configuration dictionary containing model parameters.
+        """
         super().__init__()
-        self.phase = phase
-        self.body = MobileNetV1(width_mult=width_mult)
+        backbone = build_backbone(cfg['name'], cfg['pretrain'])
+        self.fx = get_layer_extractor(cfg, backbone)  # feature extraction
 
-        in_channels = [int(256 * width_mult), int(512 * width_mult), int(1024 * width_mult)]
-        self.out_channels = 64
+        num_anchors = 2
+        base_in_channels = cfg['in_channel']
+        out_channels = cfg['out_channel']
 
-        self.fpn = FPN(in_channels, self.out_channels)
-        self.ssh1 = SSH(self.out_channels, self.out_channels)
-        self.ssh2 = SSH(self.out_channels, self.out_channels)
-        self.ssh3 = SSH(self.out_channels, self.out_channels)
+        if cfg['name'] == "mobilenet_v2":
+            fpn_in_channels = [32, 96, 1280]  # mobilenet v2
+        else:
+            fpn_in_channels = [
+                base_in_channels * 2,
+                base_in_channels * 4,
+                base_in_channels * 8,
+            ]
 
-        self.ClassHead = self._make_head(ClassHead, num_heads=3)
-        self.BboxHead = self._make_head(BboxHead, num_heads=3)
-        self.LandmarkHead = self._make_head(LandmarkHead, num_heads=3)
+        self.fpn = FPN(fpn_in_channels, out_channels)
+        self.ssh1 = SSH(out_channels, out_channels)
+        self.ssh2 = SSH(out_channels, out_channels)
+        self.ssh3 = SSH(out_channels, out_channels)
 
-    def _make_head(self, head_cls, num_heads: int) -> nn.ModuleList:
-        return nn.ModuleList([head_cls(self.out_channels, num_anchor=2) for _ in range(num_heads)])
+        self.class_head = ClassHead(in_channels=cfg['out_channel'], num_anchors=num_anchors, fpn_num=3)
+        self.bbox_head = BboxHead(in_channels=cfg['out_channel'], num_anchors=num_anchors, fpn_num=3)
+        self.landmark_head = LandmarkHead(in_channels=cfg['out_channel'], num_anchors=num_anchors, fpn_num=3)
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        c3, c4, c5 = self.body(x)
-        fpn_out = self.fpn((c3, c4, c5))
-        features = (
-            self.ssh1(fpn_out[0]),
-            self.ssh2(fpn_out[1]),
-            self.ssh3(fpn_out[2]),
-        )
+    def forward(self, x: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+        out = self.fx(x)
+        fpn = self.fpn(out)
 
-        bbox_reg = torch.cat([self.BboxHead[i](features[i]) for i in range(len(features))], dim=1)
-        cls = torch.cat([self.ClassHead[i](features[i]) for i in range(len(features))], dim=1)
-        ldm_reg = torch.cat([self.LandmarkHead[i](features[i]) for i in range(len(features))], dim=1)
+        # single-stage headless module
+        feature1 = self.ssh1(fpn[0])
+        feature2 = self.ssh2(fpn[1])
+        feature3 = self.ssh3(fpn[2])
 
-        if self.phase == "test":
-            cls = F.softmax(cls, dim=-1)
-        return bbox_reg, cls, ldm_reg
+        features = [feature1, feature2, feature3]
+
+        classifications = self.class_head(features)
+        bbox_regressions = self.bbox_head(features)
+        landmark_regressions = self.landmark_head(features)
+
+        if self.training:
+            output = (bbox_regressions, classifications, landmark_regressions)
+        else:
+            output = (bbox_regressions, F.softmax(classifications, dim=-1), landmark_regressions)
+        return output
